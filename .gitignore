@@ -1,5 +1,5 @@
 .env
 **data*/
 **certs/
-**config/*
-**lib/jars/*
+**config/
+**lib/jars/
