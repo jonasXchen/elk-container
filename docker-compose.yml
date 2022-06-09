@@ -1,0 +1,265 @@
+version: "3"
+
+services:
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    volumes:
+      - ./certs:/usr/share/elasticsearch/config/certs
+    user: "0"
+    command: >
+      bash -c '
+        if [ x${ELASTIC_PASSWORD} == x ]; then
+          echo "Set the ELASTIC_PASSWORD environment variable in the .env file";
+          exit 1;
+        elif [ x${KIBANA_PASSWORD} == x ]; then
+          echo "Set the KIBANA_PASSWORD environment variable in the .env file";
+          exit 1;
+        fi;
+        if [ ! -f config/certs/ca.zip ]; then
+          echo "Creating CA";
+          bin/elasticsearch-certutil ca --silent --pem -out config/certs/ca.zip;
+          unzip config/certs/ca.zip -d config/certs;
+        fi;
+        if [ ! -f config/certs/certs.zip ]; then
+          echo "Creating certs";
+          echo -ne \
+          "instances:\n"\
+          "  - name: ${ES_NODE_NAME1}\n"\
+          "    dns:\n"\
+          "      - ${ES_NODE_NAME1}\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          "  - name: kibana\n"\
+          "    dns:\n"\
+          "      - kibana\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          "  - name: logstash\n"\
+          "    dns:\n"\
+          "      - logstash\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          > config/certs/instances.yml;
+          bin/elasticsearch-certutil cert --silent --pem -out config/certs/certs.zip --in config/certs/instances.yml --ca-cert config/certs/ca/ca.crt --ca-key config/certs/ca/ca.key;
+          unzip config/certs/certs.zip -d config/certs;
+        fi;
+        echo "Setting file permissions"
+        chown -R root:root config/certs;
+        find . -type d -exec chmod 750 \{\} \;;
+        find . -type f -exec chmod 640 \{\} \;;
+        echo "Waiting for Elasticsearch availability";
+        until curl -s --cacert config/certs/ca/ca.crt https://${ES_NODE_NAME1}:9200 | grep -q "missing authentication credentials\|401"; do sleep 10; done;
+        echo "Setting kibana_system password";
+        until curl -s -X POST --cacert config/certs/ca/ca.crt -u ${ELASTIC_USERNAME}:${ELASTIC_PASSWORD} -H "Content-Type: application/json" https://${ES_NODE_NAME1}:9200/_security/user/kibana_system/_password -d "{\"password\":\"${KIBANA_PASSWORD}\"}" | grep -q "^{}"; do sleep 10; done;
+        echo "Setting logstash_system password";
+        until curl -s -X POST --cacert config/certs/ca/ca.crt -u ${ELASTIC_USERNAME}:${ELASTIC_PASSWORD} -H "Content-Type: application/json" https://${ES_NODE_NAME1}:9200/_security/user/logstash_system/_password -d "{\"password\":\"${LOGSTASH_PASSWORD}\"}" | grep -q "^{}"; do sleep 10; done;
+        echo "All done!";
+      '
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f config/certs/${ES_NODE_NAME1}/${ES_NODE_NAME1}.crt ]"]
+      interval: 1s
+      timeout: 5s
+      retries: 120
+
+  #${ES_NODE_NAME} = es01
+  es01:
+    depends_on:
+      setup:
+        condition: service_healthy
+    container_name: ${ES_NODE_NAME1}
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    restart: always
+    volumes:
+      - ./certs/:/usr/share/elasticsearch/config/certs/
+      - ./elasticsearch/esdata01/:/usr/share/elasticsearch/data/
+      - ./elasticsearch/config/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml
+    ports:
+      - ${ES_PORT}:9200
+    environment:
+      - network.host=0.0.0.0
+      - node.name=${ES_NODE_NAME1}
+      - cluster.name=${CLUSTER_NAME}
+      - cluster.initial_master_nodes=${ES_NODE_NAME1}
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/${ES_NODE_NAME1}/${ES_NODE_NAME1}.key
+      - xpack.security.http.ssl.certificate=certs/${ES_NODE_NAME1}/${ES_NODE_NAME1}.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.http.ssl.verification_mode=certificate
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/${ES_NODE_NAME1}/${ES_NODE_NAME1}.key
+      - xpack.security.transport.ssl.certificate=certs/${ES_NODE_NAME1}/${ES_NODE_NAME1}.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+      - xpack.license.self_generated.type=${LICENSE}
+    networks:
+      - webserver_nginx-network
+    mem_limit: ${MEM_LIMIT}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q -e 'missing authentication credentials' -e 401",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+
+
+
+  logstash:
+    depends_on:
+      #${ES_NODE_NAME} = es01
+      es01:
+        condition: service_healthy
+    image: docker.elastic.co/logstash/logstash:${STACK_VERSION}
+    restart: always
+    volumes:
+      - ./certs/:/usr/share/logstash/config/certs/
+      - ./logstash/pipeline/logstash.conf:/usr/share/logstash/pipeline/logstash.conf
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml
+      - ./logstash/config/log4j2.properties:/usr/share/logstash/config/log4j2.properties
+      - ./logstash/data/data.csv:/usr/share/logstash/data/data.csv
+      - ./logstash/lib/jars:/usr/share/logstash/lib/jars
+    user: root
+    ports:
+      - 9601:9601
+    environment:
+      - HTTP_HOST=0.0.0.0
+      - NODE_NAME=logstash
+      - API_HTTP_PORT=9601
+      - ELASTIC_USERNAME=${ELASTIC_USERNAME}
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - PG_ADMIN=${PG_ADMIN}
+      - PG_PASSWORD=${PG_PASSWORD}
+      - XPACK_MONITORING_ENABLED=true
+      - XPACK_MONITORING_ELASTICSEARCH_HOSTS=https://${ES_NODE_NAME1}:9200
+      - XPACK_MONITORING_ELASTICSEARCH_USERNAME=logstash_system
+      - XPACK_MONITORING_ELASTICSEARCH_PASSWORD=${LOGSTASH_PASSWORD}
+      - XPACK_MONITORING_ELASTICSEARCH_SSL_CERTIFICATE_AUTHORITY=/usr/share/logstash/config/certs/ca/ca.crt
+      - XPACK_MONITORING_ELASTICSEARCH_SSL_VERIFICATION_MODE=certificate
+    networks:
+      - webserver_nginx-network
+    healthcheck:
+        test:
+          [
+            "CMD-SHELL",
+            "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q -e 'missing authentication credentials' -e 401",
+          ]
+        interval: 10s
+        timeout: 10s
+        retries: 120
+
+
+
+  kibana:
+    depends_on:
+      #${ES_NODE_NAME} = es01
+      es01:
+        condition: service_healthy
+    image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
+    restart: always
+    volumes:
+      - ./certs:/usr/share/kibana/config/certs
+      - ./kibana/data:/usr/share/kibana/data
+      - ./kibana/config/kibana.yml:/usr/share/kibana/config/kibana.yml
+    ports:
+      - ${KIBANA_PORT}:5601
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_NAME=kibana
+      - SERVER_PUBLICBASEURL=${PUBLIC_SERVER_BASEURL}
+      - ELASTICSEARCH_HOSTS=https://${ES_NODE_NAME1}:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=config/certs/ca/ca.crt
+      - SERVER_SSL_ENABLED=true
+      - SERVER_SSL_CERTIFICATE=config/certs/kibana/kibana.crt
+      - SERVER_SSL_KEY=config/certs/kibana/kibana.key
+      - SERVER_SSL_CERTIFICATEAUTHORITIES=config/certs/ca/ca.crt
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=${KIBANA_OBJECTENCRYPTIONKEY}
+      - XPACK_SECURITY_ENABLED=true
+      - XPACK_SECURITY_ENCRYPTIONKEY=${KIBANA_ENCRYPTIONKEY}
+      - XPACK_SECURITY_COOKIENAME=kbid
+      - XPACK_SECURITY_SECURECOOKIES=true
+      - XPACK_SECURITY_SAMESITECOOKIES=None
+      - XPACK_SECURITY_SESSION_IDLETIMEOUT=10h
+      - XPACK_SECURITY_SESSION_LIFESPAN=1w
+      - ENTERPRISESEARCH_HOST=http://enterprisesearch:3002
+    networks:
+      - webserver_nginx-network
+    mem_limit: ${MEM_LIMIT}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s --cacert config/certs/ca/ca.crt https://localhost:5601 | grep -q -e 'missing authentication credentials' -e 401",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+
+
+  enterprisesearch:
+      depends_on:
+        es01:
+          condition: service_healthy
+        kibana:
+          condition: service_healthy
+      image: docker.elastic.co/enterprise-search/enterprise-search:${STACK_VERSION}
+      restart: always
+      volumes:
+        - ./certs:/usr/share/enterprise-search/config/certs
+        # - ./enterprisesearch/data:/usr/share/enterprise-search/config
+      ports:
+        - ${ENTERPRISE_SEARCH_PORT}:3002
+      environment:
+        - SERVERNAME=enterprisesearch
+        - secret_management.encryption_keys=[${ENCRYPTION_KEYS}]
+        - allow_es_settings_modification=true
+        - elasticsearch.host=https://${ES_NODE_NAME1}:9200
+        - elasticsearch.username=elastic
+        - elasticsearch.password=${ELASTIC_PASSWORD}
+        - elasticsearch.ssl.enabled=true
+        - elasticsearch.ssl.certificate_authority=/usr/share/enterprise-search/config/certs/ca/ca.crt
+        - kibana.host=https://kibana:5601
+        # - kibana.ssl.enabled=true
+        # - kibana.ssl.certificate_authority=/usr/share/enterprise-search/config/certs/ca/ca.crt
+      networks:
+        - webserver_nginx-network
+      user: root
+      mem_limit: ${ENTERPRISE_SEARCH_MEM_LIMIT}
+      healthcheck:
+        test:
+          [
+              "CMD-SHELL",
+              "curl -s -I http://localhost:3002 | grep -q 'HTTP/1.1 302 Found'",
+          ]
+        interval: 10s
+        timeout: 10s
+        retries: 120
+
+
+  # elastic-agent:
+  #   image: docker.elastic.co/beats/elastic-agent:${STACK_VERSION}
+  #   container_name: elastic-agent
+  #   restart: always
+  #   user: root # note, synthetic browser monitors require this set to `elastic-agent`
+  #   environment:
+  #     - FLEET_SERVER_ENABLE=true
+  #     - FLEET_SERVER_ELASTICSEARCH_HOST=https://${ES_NODE_NAME1}:9200
+  #     - FLEET_SERVER_SERVICE_TOKEN=${FLEET_SERVER_SERVICE_TOKEN}
+  #     - FLEET_SERVER_POLICY_ID=${FLEET_SERVER_POLICY_ID}
+
+networks:
+  webserver_nginx-network:
+    external: true

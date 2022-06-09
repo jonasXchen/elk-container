@@ -1,0 +1,9 @@
+api.http.port: 9601
+http.host: 0.0.0.0
+node.name: logstash
+xpack.monitoring.elasticsearch.hosts: https://es01:9200
+xpack.monitoring.elasticsearch.password: A5GZATXHYg2ptMPkaET29GhnTez859qafRySJTAHSExzFELM
+xpack.monitoring.elasticsearch.ssl.certificate_authority: /usr/share/logstash/config/certs/ca/ca.crt
+xpack.monitoring.elasticsearch.ssl.verification_mode: certificate
+xpack.monitoring.elasticsearch.username: logstash_system
+xpack.monitoring.enabled: true
