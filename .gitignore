@@ -1,5 +1,2 @@
-.env
-**data*/
-**certs/
-**config/
-**lib/jars/
+**
+!docker-compose.yml
